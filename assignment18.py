@@ -1,65 +1,58 @@
 #!/usr/bin/env python
+from assignment8 import StressStrainConverter
 import numpy as np
+import scipy.integrate
 
 from PyTrilinos import Epetra
-from PyTrilinos import AztecOO
-from PyTrilinos import Teuchos
-from PyTrilinos import Isorropia
 
-class OneDimLaplace(object):
+class EpetraParallelToughness(StressStrainConverter):
 
-    def __init__(self, comm, number_of_elements=10):
-
+    def __init__(self, filename, comm):
+        super().__init__(filename)
+        
         self.comm = comm
         self.rank = comm.MyPID()
         self.size = comm.NumProc()
 
         if self.rank == 0:
-            number_of_rows = number_of_elements
+            self.convert_to_true_stress_and_strain()
         else:
-            number_of_rows = 0
+            self.true_stress = np.array([], dtype=np.double)
+            self.true_strain = np.array([], dtype=np.double)
+
+        unbalanced_map = Epetra.Map(-1, self.true_stress.shape[0], 0, self.comm)
+        #print(unbalanced_map)
+        unbalanced_stress = Epetra.Vector(Epetra.Copy, unbalanced_map, self.true_stress)
+        unbalanced_strain = Epetra.Vector(Epetra.Copy, unbalanced_map, self.true_strain)
         
-        unbalanced_map = Epetra.Map(-1, number_of_rows, 0, self.comm)
-
-        self.A = Epetra.CrsMatrix(Epetra.Copy, unbalanced_map, 3)
-        self.x = Epetra.Vector(unbalanced_map) 
-        self.b = Epetra.Vector(unbalanced_map) 
+        balanced_map = self.create_balanced_map(unbalanced_map)
+        #print(balanced_map)
+        self.true_stress = Epetra.Vector(balanced_map)
+        self.true_strain = Epetra.Vector(balanced_map)
         
-        print(self.b)
-       
-        for gid in unbalanced_map.MyGlobalElements():
-            if gid == 0: 
-                self.A.InsertGlobalValues(gid,[1],[gid])
-                self.b[0] = -1
-            elif gid == (number_of_elements - 1): 
-                self.A.InsertGlobalValues(gid,[1],[gid])
-                self.b[-1] = 1
-            else: 
-                self.A.InsertGlobalValues(gid,[-1,2,-1],[gid-1,gid,gid+1])
+        importer = Epetra.Import(balanced_map, unbalanced_map)
+        
+        self.true_stress.Import(unbalanced_stress, importer, Epetra.Insert)
+        self.true_strain.Import(unbalanced_strain, importer, Epetra.Insert)
+        
+    def create_balanced_map(self, unbalanced_map):
+        
+        temp_map = Epetra.Map(unbalanced_map.NumGlobalElements(), 0, self.comm)
+        
+        my_global_element_list = temp_map.MyGlobalElements()
+        
+        if self.rank < (self.size-1):
+            my_global_element_list = np.append(my_global_element_list, [temp_map.MaxMyGID() + 1])
+            
+        return Epetra.Map(-1, list(my_global_element_list), 0, self.comm)
+        
+        
+    def compute_toughness(self):
+        
+        my_toughness = scipy.integrate.trapz(self.true_stress, self.true_strain)
 
-        self.A.FillComplete()
+        return self.comm.SumAll(my_toughness)
 
-    def load_balance(self):
-
-        parameter_list = Teuchos.ParameterList() 
-        parameter_sublist = parameter_list.sublist("ZOLTAN")
-        parameter_sublist.set("DEBUG_LEVEL", "0")
-        partitioner = Isorropia.Epetra.Partitioner(self.A, parameter_list) 
-        redistributor = Isorropia.Epetra.Redistributor(partitioner) 
-        self.A = redistributor.redistribute(self.A)
-        self.x = redistributor.redistribute(self.x)
-        self.b = redistributor.redistribute(self.b)
-        return
-
-    def solve(self):
-
-        linear_problem = Epetra.LinearProblem(self.A, self.x, self.b) 
-        solver = AztecOO.AztecOO(linear_problem) 
-        solver.Iterate(10000, 1.e-5) 
-        return
-
-    def get_solution(self):
-        return self.x
 
 if __name__ == "__main__":
 
@@ -67,8 +60,7 @@ if __name__ == "__main__":
 
     comm = Epetra.PyComm()
 
-    solver = OneDimLaplace(comm)
-    solver.load_balance()
-    solver.solve()
+    T = EpetraParallelToughness('data.dat', comm)
 
-    solver.get_solution()
+    if comm.MyPID() == 0:
+        print(T.compute_toughness())
